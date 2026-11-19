@@ -196,8 +196,11 @@ export const strapiAdapter = (config?: StrapiAdapterConfig) => {
             limit: 1,
           });
 
+          // Better Auth's adapter contract: `update` resolves to `null` when the
+          // where clause matches no row, and callers rely on that to detect a
+          // stale or already-used record.
           if (!record) {
-            throw new Error(`Record not found for model ${model}`);
+            return null;
           }
 
           const result = await strapi.documents(uid).update({
@@ -293,6 +296,48 @@ export const strapiAdapter = (config?: StrapiAdapterConfig) => {
           }
 
           return records.length;
+        },
+
+        /**
+         * Atomically consume (read and delete) a single record
+         *
+         * Better Auth uses this for single-use values such as verification
+         * tokens, OTPs and magic links. Without a native implementation it
+         * falls back to a generic one that deletes using every field of the row
+         * it read as a guard, which includes Strapi's own fields (`documentId`,
+         * `publishedAt`, `locale`). Those are unknown to Better Auth's schema,
+         * so the fallback throws `Field documentId not found in model …`.
+         *
+         * The read goes through the Document Service like the other methods.
+         * The delete goes through the Query Engine, whose `deleteMany` reports
+         * how many rows the DELETE statement removed: when two requests consume
+         * the same row concurrently, only the one whose DELETE removed it gets
+         * the row back, so the value is used at most once.
+         */
+        consumeOne: async ({ where, model }) => {
+          debugLog("consumeOne", { model, where });
+
+          const uid = getModelUid(model);
+          const filters = transformFilters(where, model, getFieldName);
+
+          const record = await strapi.documents(uid).findFirst({
+            filters,
+            limit: 1,
+          });
+
+          if (!record) {
+            return null;
+          }
+
+          const { count } = await strapi.db.query(uid).deleteMany({
+            where: { $and: [{ id: record.id }, filters] },
+          });
+
+          if (count !== 1) {
+            return null;
+          }
+
+          return transformStrapiOutput(record);
         },
 
         /**
